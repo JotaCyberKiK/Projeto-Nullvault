@@ -17,7 +17,7 @@ LAUNCHER="$BIN_DIR/nullvault"
 [[ ! -e "$LAUNCHER" && ! -L "$LAUNCHER" ]] || fail "Já existe $LAUNCHER; instalação cancelada para não sobrescrever o comando."
 python3 -c 'import tkinter' || fail 'Tkinter ausente. No Debian: sudo apt install python3-tk'
 python3 -m venv --help >/dev/null 2>&1 || fail 'Instale python3-venv.'
-mkdir -p "$BIN_DIR"
+mkdir -p "$HOME/.local/share" "$BIN_DIR"
 mkdir -m 700 "$APP_DIR"
 trap 'printf "Instalação interrompida. Confira %s antes de tentar novamente.\n" "$APP_DIR" >&2' ERR
 cp -- "$SOURCE" "$APP_DIR/Nullvouts.py"
