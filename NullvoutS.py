@@ -5,12 +5,14 @@ import getpass
 import hashlib
 import hmac
 import json
+import logging
 import math
 import os
 import secrets
+import shutil
 import stat
 import string
-import subprocess
+import subprocess  # nosec B404 - usado só para icacls (Windows) e xprop (Linux), sem shell
 import sys
 import threading
 import time
@@ -19,12 +21,23 @@ import zlib
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+from pathlib import Path
 
 if getattr(sys, "frozen", False):
     PASTA = os.path.dirname(sys.executable)
 else:
     PASTA = os.path.dirname(os.path.abspath(__file__))
 os.chdir(PASTA)
+
+_LOG_TECNICO = logging.getLogger("nullvouts")
+
+
+def _tolerar(exc, contexto=""):
+    """Falha tolerada de propósito (melhor esforço): em vez de engolir a exceção
+    em silêncio, registra em DEBUG apenas o contexto e o TIPO dela. Nunca grava
+    a mensagem da exceção, para não vazar caminhos ou dados sensíveis."""
+    _LOG_TECNICO.debug("falha tolerada em %s: %s", contexto, type(exc).__name__)
+
 
 ARQUIVO = "cofre.dat"
 BACKUP = "cofre.bak"
@@ -195,8 +208,8 @@ def apagar_bytes_efemeros(dados):
     try:
         offset = sys.getsizeof(b"") - 1
         ctypes.memset(id(dados) + offset, 0, len(dados))
-    except Exception:
-        pass
+    except Exception as _exc:
+        _tolerar(_exc, "apagar_bytes_efemeros")
 
 
 # ------------------------------------------- detecção de pendrive e arquivos
@@ -219,8 +232,8 @@ def detectar_pendrives():
                         letra = f"{chr(65 + i)}:\\"
                         if os.path.isdir(letra):
                             unidades.append(letra)
-        except Exception:
-            pass
+        except Exception as _exc:
+            _tolerar(_exc, "detectar_pendrives")
     else:
         usuario = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
         bases = [
@@ -241,7 +254,8 @@ def detectar_pendrives():
                         if real not in vistos and os.access(caminho, os.W_OK):
                             vistos.add(real)
                             unidades.append(caminho)
-            except OSError:
+            except OSError as _exc:
+                _tolerar(_exc, "detectar_pendrives")
                 continue
     return unidades
 
@@ -290,13 +304,13 @@ def restringir_permissoes(caminho, fd=None):
         if fd is not None:
             try:
                 os.fchmod(fd, 0o600)
-            except OSError:
-                pass
+            except OSError as _exc:
+                _tolerar(_exc, "restringir_permissoes")
         else:
             try:
                 os.chmod(caminho, 0o600)
-            except OSError:
-                pass
+            except OSError as _exc:
+                _tolerar(_exc, "restringir_permissoes")
     else:
         usuario = os.environ.get("USERNAME")
         if not usuario:
@@ -304,15 +318,19 @@ def restringir_permissoes(caminho, fd=None):
         try:
             dominio = os.environ.get("USERDOMAIN")
             alvo = f"{dominio}\\{usuario}" if dominio else usuario
-            subprocess.run(
-                ["icacls", caminho, "/inheritance:r", "/grant:r", f"{alvo}:(F)"],
+            # Caminho absoluto: evita que um icacls.exe plantado no PATH/pasta atual seja executado.
+            icacls = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                                  "System32", "icacls.exe")
+            # Lista de argumentos, sem shell; "caminho" é um argumento isolado, não é interpretado.
+            subprocess.run(  # nosec B603
+                [icacls, caminho, "/inheritance:r", "/grant:r", f"{alvo}:(F)"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-        except Exception:
-            pass
+        except Exception as _exc:
+            _tolerar(_exc, "restringir_permissoes")
 
 
 def escrever_seguro(caminho, dados):
@@ -340,8 +358,8 @@ def escrever_seguro(caminho, dados):
             f.flush()
             try:
                 os.fsync(f.fileno())
-            except OSError:
-                pass
+            except OSError as _exc:
+                _tolerar(_exc, "escrever_seguro")
         os.replace(temporario, caminho_abs)
         if os.name == "nt":
             restringir_permissoes(caminho_abs)
@@ -349,8 +367,8 @@ def escrever_seguro(caminho, dados):
         try:
             if os.path.exists(temporario):
                 os.remove(temporario)
-        except OSError:
-            pass
+        except OSError as _exc:
+            _tolerar(_exc, "escrever_seguro")
         raise
     if os.name != "nt":
         try:
@@ -359,8 +377,8 @@ def escrever_seguro(caminho, dados):
                 os.fsync(dfd)
             finally:
                 os.close(dfd)
-        except OSError:
-            pass
+        except OSError as _exc:
+            _tolerar(_exc, "escrever_seguro")
 
 
 def anexar_seguro(caminho, dados):
@@ -374,8 +392,8 @@ def anexar_seguro(caminho, dados):
         f.flush()
         try:
             os.fsync(f.fileno())
-        except OSError:
-            pass
+        except OSError as _exc:
+            _tolerar(_exc, "anexar_seguro")
     if os.name == "nt" and novo:
         restringir_permissoes(caminho)
 
@@ -391,14 +409,14 @@ def apagar_seguro(caminho):
             f.flush()
             try:
                 os.fsync(f.fileno())
-            except OSError:
-                pass
-    except OSError:
-        pass
+            except OSError as _exc:
+                _tolerar(_exc, "apagar_seguro")
+    except OSError as _exc:
+        _tolerar(_exc, "apagar_seguro")
     try:
         os.remove(caminho)
-    except OSError:
-        pass
+    except OSError as _exc:
+        _tolerar(_exc, "apagar_seguro")
 
 
 # ------------------------ proteção de estado no SO (DPAPI / guarda local)
@@ -495,8 +513,8 @@ def salvar_guarda_so(dados_dict):
         atual.update(dados_dict)
         bruto = json.dumps(atual, separators=(",", ":"), sort_keys=True).encode("utf-8")
         escrever_seguro(caminho, _dpapi_proteger(bruto))
-    except Exception:
-        pass
+    except Exception as _exc:
+        _tolerar(_exc, "salvar_guarda_so")
 
 
 def registrar_ancora_guarda(ancora):
@@ -1832,8 +1850,8 @@ def carregar_palavras():
             for p in bruto_embutido.decode("utf-8").splitlines():
                 if p:
                     palavras.add(p)
-    except Exception:
-        pass
+    except Exception as _exc:
+        _tolerar(_exc, "carregar_palavras")
 
     pasta_listas = os.path.join(PASTA, "listas")
     if os.path.isdir(pasta_listas):
@@ -2046,7 +2064,8 @@ def ultimas_entradas(quantas):
         for linha in f:
             try:
                 lidas.append(json.loads(linha))
-            except Exception:
+            except Exception as _exc:
+                _tolerar(_exc, "ultimas_entradas")
                 continue
     return lidas[-quantas:]
 
@@ -2102,8 +2121,8 @@ def ler_estado():
                       "liberado_em": max(lib_so, time.time() + 300)}
             try:
                 salvar_estado(estado)
-            except OSError:
-                pass
+            except OSError as _exc:
+                _tolerar(_exc, "ler_estado")
             return estado
         return {"erros": 0, "liberado_em": 0}
     try:
@@ -2122,8 +2141,8 @@ def ler_estado():
                   "liberado_em": max(time.time() + 300, lib_so)}
         try:
             salvar_estado(estado)
-        except OSError:
-            pass
+        except OSError as _exc:
+            _tolerar(_exc, "ler_estado")
         return estado
 
 
@@ -2389,19 +2408,19 @@ def criar_keyfile(caminho):
             f.flush()
             try:
                 os.fsync(f.fileno())
-            except OSError:
-                pass
+            except OSError as _exc:
+                _tolerar(_exc, "criar_keyfile")
         os.replace(temporario, caminho_norm)
         try:
             restringir_permissoes(caminho_norm)
-        except Exception:
-            pass
+        except Exception as _exc:
+            _tolerar(_exc, "criar_keyfile")
     except BaseException:
         try:
             if os.path.exists(temporario):
                 os.remove(temporario)
-        except OSError:
-            pass
+        except OSError as _exc:
+            _tolerar(_exc, "criar_keyfile")
         raise
     finally:
         apagar_bytes_efemeros(dados)
@@ -2786,7 +2805,8 @@ def abrir_cofre(senha_infra, caminho_keyfile=None, segunda_senha=None, sair_em_e
                             chave_dados = _desembrulhar_slot(kek_cand, slot_bytes, cabecalho_base)
                             abriu_recuperacao = eh_rec
                             break
-                        except InvalidTag:
+                        except InvalidTag as _exc:
+                            _tolerar(_exc, "abrir_cofre")
                             continue
                     if chave_dados is not None:
                         break
@@ -3015,7 +3035,8 @@ def verificar_segundo_fator_atual(segredo_infra_buf, meta, caminho_kf_tentativa=
                         return True, ""
                 finally:
                     apagar_buffer(kf_buf)
-            except Exception:
+            except Exception as _exc:
+                _tolerar(_exc, "verificar_segundo_fator_atual")
                 continue
 
     # 2. Tenta validar pela Segunda Senha atual (caso o pendrive não esteja conectado)
@@ -3029,8 +3050,8 @@ def verificar_segundo_fator_atual(segredo_infra_buf, meta, caminho_kf_tentativa=
                     return True, ""
             finally:
                 apagar_buffer(s2_buf)
-        except Exception:
-            pass
+        except Exception as _exc:
+            _tolerar(_exc, "verificar_segundo_fator_atual")
 
     if tem_kf and tem_s2:
         return False, (
@@ -3076,11 +3097,34 @@ def tocar():
     SESSAO["ultima"] = time.time()
 
 
+def habilitar_ansi_windows():
+    """Liga o processamento de sequências ANSI no console do Windows 10+ pela API
+    nativa (SetConsoleMode), sem invocar o shell. Devolve True se conseguiu."""
+    if os.name != "nt":
+        return True
+    try:
+        from ctypes import wintypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetStdHandle.restype = wintypes.HANDLE
+        kernel32.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        modo = wintypes.DWORD()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(modo)):
+            return False
+        # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        return bool(kernel32.SetConsoleMode(handle, modo.value | 0x0004))
+    except Exception as exc:
+        _tolerar(exc, "habilitar_ansi_windows")
+        return False
+
+
 def limpar_tela():
     if not sys.stdout.isatty():
         return
-    if os.name == "nt":
-        os.system("cls")
+    if os.name == "nt" and not habilitar_ansi_windows():
+        print("\n" * 120, end="", flush=True)  # console legado sem ANSI
+        return
     print("\033[3J\033[2J\033[H", end="", flush=True)
 
 
@@ -3092,8 +3136,8 @@ def bloquear_sessao_imediato(silencioso=False):
         if COFRE_RAM.aberto:
             registrar("sessao_bloqueada")
             gravar_cofre_memoria(manter_backup=True, renovar_salt=False)
-    except Exception:
-        pass
+    except Exception as _exc:
+        _tolerar(_exc, "bloquear_sessao_imediato")
     finally:
         COFRE_RAM.limpar()
         limpar_chave_log()
@@ -3400,7 +3444,7 @@ def main_cli():
               "senha aparece enquanto você digita.")
         raise SystemExit(1)
     if os.name == "nt":
-        os.system("")
+        habilitar_ansi_windows()
 
     if os.path.exists(ARQUIVO):
         verificar_bloqueio()
@@ -3539,8 +3583,8 @@ def main_cli():
             registrar("saida")
             try:
                 gravar_cofre_memoria(manter_backup=True, renovar_salt=False)
-            except Exception:
-                pass
+            except Exception as _exc:
+                _tolerar(_exc, "main_cli")
         COFRE_RAM.limpar()
         limpar_chave_log()
         limpar_tela()
@@ -3575,8 +3619,8 @@ def aplicar_barra_titulo_preta(janela_tk):
                 uxtheme = ctypes.windll.uxtheme
                 uxtheme[135](2)          # SetPreferredAppMode(ForceDark = 2)
                 uxtheme[133](hwnd, 1)    # AllowDarkModeForWindow(hwnd, True)
-            except Exception:
-                pass
+            except Exception as _exc:
+                _tolerar(_exc, "aplicar_barra_titulo_preta")
 
             # DWMWA_USE_IMMERSIVE_DARK_MODE (20 no Win10 2004+/Win11, 19 em builds anteriores)
             modo_escuro = ctypes.c_int(1)
@@ -3614,8 +3658,13 @@ def aplicar_barra_titulo_preta(janela_tk):
         try:
             janela_tk.update_idletasks()
             wid = hex(janela_tk.winfo_id())
-            subprocess.run(
-                ["xprop", "-id", wid, "-f", "_GTK_THEME_VARIANT", "8u", "-set", "_GTK_THEME_VARIANT", "dark"],
+            # Resolve o executável para caminho absoluto; sem xprop instalado, não faz nada.
+            xprop = shutil.which("xprop")
+            if not xprop:
+                return False
+            # Lista de argumentos, sem shell; wid vem de hex(int) gerado pelo próprio Tk.
+            subprocess.run(  # nosec B603
+                [xprop, "-id", wid, "-f", "_GTK_THEME_VARIANT", "8u", "-set", "_GTK_THEME_VARIANT", "dark"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
@@ -3694,8 +3743,8 @@ def copiar_clipboard_protegido(janela_tk, texto_secreto):
                     return
                 finally:
                     user32.CloseClipboard()
-        except Exception:
-            pass
+        except Exception as _exc:
+            _tolerar(_exc, "copiar_clipboard_protegido")
     janela_tk.clipboard_clear()
     janela_tk.clipboard_append(texto_secreto)
     janela_tk.update_idletasks()
@@ -3707,8 +3756,8 @@ def limpar_clipboard_seguro(janela_tk):
         janela_tk.clipboard_append("")
         janela_tk.clipboard_clear()
         janela_tk.update_idletasks()
-    except Exception:
-        pass
+    except Exception as _exc:
+        _tolerar(_exc, "limpar_clipboard_seguro")
 
 
 def limpar_entry_seguro(entry_widget):
@@ -3716,8 +3765,8 @@ def limpar_entry_seguro(entry_widget):
         entry_widget.delete(0, "end")
         entry_widget.insert(0, "0" * 64)
         entry_widget.delete(0, "end")
-    except Exception:
-        pass
+    except Exception as _exc:
+        _tolerar(_exc, "limpar_entry_seguro")
 
 
 # -------------------------------------------- interface gráfica (Tkinter)
@@ -3785,15 +3834,17 @@ class NullvoutsGUI:
         else:
             self.mostrar_tela_criacao()
 
+    
     def _carregar_icone(self):
-        for nome_ico in ("nullvouts.ico", "icone.ico", "icon.ico", "app.ico"):
-            caminho_ico = os.path.join(PASTA, nome_ico)
-            if os.path.isfile(caminho_ico):
-                try:
-                    self.raiz.iconbitmap(caminho_ico)
-                    break
-                except Exception:
-                    pass
+        base_icone = getattr(sys, "_MEIPASS", PASTA)
+        caminho_ico = os.path.join(base_icone, "icone.ico")
+
+        if os.path.isfile(caminho_ico):
+            try:
+                self.raiz.iconbitmap(default=caminho_ico)
+            except self.tk.TclError:
+                pass
+
 
     def _aplicar_protecao_janela(self):
         aplicar_barra_titulo_preta(self.raiz)
@@ -4554,8 +4605,8 @@ class NullvoutsGUI:
         if self._timer_revelacao is not None:
             try:
                 self.raiz.after_cancel(self._timer_revelacao)
-            except Exception:
-                pass
+            except Exception as _exc:
+                _tolerar(_exc, "_cancelar_revelacao")
             self._timer_revelacao = None
         if hasattr(self, "lbl_valor_segredo") and self.lbl_valor_segredo.winfo_exists():
             self.lbl_valor_segredo.configure(text="••••••••••••••••••••••••", fg=COR_TEXTO)
@@ -4578,8 +4629,8 @@ class NullvoutsGUI:
         if self._timer_clipboard is not None:
             try:
                 self.raiz.after_cancel(self._timer_clipboard)
-            except Exception:
-                pass
+            except Exception as _exc:
+                _tolerar(_exc, "_iniciar_contagem_clipboard")
         self._segundos_clipboard = TEMPO_TELA
         self._tick_clipboard(prefixo)
 
@@ -4606,8 +4657,8 @@ class NullvoutsGUI:
         if self._timer_clipboard is not None:
             try:
                 self.raiz.after_cancel(self._timer_clipboard)
-            except Exception:
-                pass
+            except Exception as _exc:
+                _tolerar(_exc, "_ocultar_e_limpar_agora")
             self._timer_clipboard = None
         limpar_clipboard_seguro(self.raiz)
         if hasattr(self, "lbl_rodape") and self.lbl_rodape.winfo_exists():
@@ -5239,26 +5290,34 @@ class NullvoutsGUI:
             registrar("saida")
             try:
                 gravar_cofre_memoria(manter_backup=True, renovar_salt=False)
-            except Exception:
-                pass
+            except Exception as _exc:
+                _tolerar(_exc, "encerrar_seguro")
         COFRE_RAM.limpar()
         limpar_chave_log()
         try:
             self.raiz.destroy()
-        except Exception:
-            pass
+        except Exception as _exc:
+            _tolerar(_exc, "encerrar_seguro")
 
 
 # Alias para retrocompatibilidade
 NuvoltsGUI = NullvoutsGUI
 
 
+
 def iniciar_gui():
     proteger_processo()
     import tkinter as tk
+
+    if sys.platform == "win32":
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "NullVouts.Desktop"
+        )
+
     raiz = tk.Tk()
     NullvoutsGUI(raiz)
     raiz.mainloop()
+
 
 
 if __name__ == "__main__":
